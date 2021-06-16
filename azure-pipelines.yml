@@ -1,0 +1,133 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger:
+- main
+
+
+resources:
+  webhooks:
+    - webhook: k8sevents
+      connection: k8sevents
+      filters:
+        - path: 'eventmeta.kind' 
+          value: secret
+      
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+- group: webhooklibrary
+
+steps:
+- script: (mkdir ~/.kube || true) && echo $(k8scfg) | base64 --decode > ~/.kube/config
+  displayName: 'get k8s config'
+
+- script: |
+    echo Add other tasks to build, test, and deploy your project.
+    echo "kind: ${{ parameters.k8sevents.eventmeta.kind }}"
+    echo "reason: ${{ parameters.k8sevents.eventmeta.reason }}"
+    echo "namespace: ${{ parameters.k8sevents.eventmeta.namespace }}"
+    echo "name: ${{ parameters.k8sevents.eventmeta.name }}"
+    echo "have a nice day."
+    
+    set +x
+
+    export testKind=${{ parameters.k8sevents.eventmeta.kind }}
+    export testReason=${{ parameters.k8sevents.eventmeta.reason }}
+    export namespace=${{ parameters.k8sevents.eventmeta.namespace }}
+    export name=${{ parameters.k8sevents.eventmeta.name }}
+        
+    touch $(Pipeline.Workspace)/KEYSETTING.sh
+
+    # store as b64 yaml
+    IFS='/'
+    read -a strarr <<<"$name"
+    if [[ $testReason == "created" ]]; then
+        echo "Namespace: ${strarr[0]}"
+        echo "Secret: ${strarr[1]}"
+    else
+        echo "Namespace: $namespace"
+        echo "Secret: $name"
+    fi
+
+    if [[ $testReason == "deleted" ]]; then
+        echo "az keyvault secret set-attributes --name k8ssecret-${strarr[0]}-${strarr[1]} --vault-name myiackv --enabled false" >> $(Pipeline.Workspace)/KEYSETTING.sh
+    elif [[ $testReason == "updated" ]]; then
+        `kubectl get secret -n ${strarr[0]} ${strarr[1]} -o yaml | base64 -w 0 > $(Pipeline.Workspace)/val-b64.txt`
+        echo "az keyvault secret set-attributes --name k8ssecret-${strarr[0]}-${strarr[1]} --vault-name myiackv --enabled true" >> $(Pipeline.Workspace)/KEYSETTING.sh
+        echo "az keyvault secret set --name k8ssecret-${strarr[0]}-${strarr[1]} --vault-name myiackv --file $(Pipeline.Workspace)/val-b64.txt" >> $(Pipeline.Workspace)/KEYSETTING.sh
+    else
+        `kubectl get secret -n $namespace $name -o yaml | base64 -w 0 > $(Pipeline.Workspace)/val-b64.txt`
+        echo "az keyvault secret set-attributes --name k8ssecret-$namespace-$name --vault-name myiackv --enabled true" >> $(Pipeline.Workspace)/KEYSETTING.sh
+        echo "az keyvault secret set --name k8ssecret-$namespace-$name --vault-name myiackv --file $(Pipeline.Workspace)/val-b64.txt" >> $(Pipeline.Workspace)/KEYSETTING.sh
+    fi
+
+    # store as keys
+    if [[ $testReason == "created" ]]; then
+        IFS=$'\n'
+        for row in $(kubectl get secret -n $namespace $name -o json | jq '.data')
+        do
+            if [[ "$row" == *":"* ]]; then
+                keyName=`echo $row | sed 's/:.*//' | sed 's/"//g' | sed 's/ //g'`
+                keyValue=`echo $row | sed 's/^.*://' | sed 's/"//g' | tr -d '\n' | sed 's/ //g' | sed 's/,$//'`
+                `echo $keyValue | base64 --decode > $(Pipeline.Workspace)/$keyName-kvDec.txt`
+                echo "az keyvault secret set --name $namespace-$name-$keyName --vault-name myiackv --file $(Pipeline.Workspace)/$keyName-kvDec.txt" >> $(Pipeline.Workspace)/KEYSETTING.sh
+                echo "az keyvault secret set-attributes --name $namespace-$name-$keyName --vault-name myiackv --enabled true" >> $(Pipeline.Workspace)/KEYSETTING.sh
+            fi
+        done
+    fi
+
+    if [[ $testReason == "updated" ]]; then
+        IFS='/'
+        read -a strarr <<<"$name"
+        echo "Namespace: ${strarr[0]}"
+        echo "Secret: ${strarr[1]}"
+
+        #kubectl get secret -n ${strarr[0]}  ${strarr[1]} -o json | jq '.data'
+        IFS=$'\n'
+        for row in $(kubectl get secret -n ${strarr[0]}  ${strarr[1]} -o json | jq '.data')
+        do
+            if [[ "$row" == *":"* ]]; then
+                keyName=`echo $row | sed 's/:.*//' | sed 's/"//g' | sed 's/ //g'`
+                keyValue=`echo $row | sed 's/^.*://' | sed 's/"//g' | tr -d '\n' | sed 's/ //g' | sed 's/,$//'`
+                `echo $keyValue | base64 --decode > $(Pipeline.Workspace)/$keyName-kvDec.txt`
+                echo "az keyvault secret set --name ${strarr[0]}-${strarr[1]}-$keyName --vault-name myiackv --file $(Pipeline.Workspace)/$keyName-kvDec.txt" >> $(Pipeline.Workspace)/KEYSETTING.sh
+                echo "az keyvault secret set-attributes --name ${strarr[0]}-${strarr[1]}-$keyName --vault-name myiackv --enabled true" >> $(Pipeline.Workspace)/KEYSETTING.sh
+            fi
+        done
+    fi
+
+    # deleted
+    if [[ $testReason == "deleted" ]]; then
+        IFS='/'
+        read -a strarr <<<"$name"
+        echo "Namespace: ${strarr[0]}"
+        echo "Secret: ${strarr[1]}"
+
+        echo "az keyvault secret list --vault-name myiackv -o json | jq -r '.[] | .name' | grep '^${strarr[0]}-${strarr[1]}-' | sed 's/^\(.*\)$/az keyvault secret set-attributes --name \1 --vault-name myiackv --enabled false/g' | bash"  >> $(Pipeline.Workspace)/KEYSETTING.sh
+    fi
+    
+    chmod 755 $(Pipeline.Workspace)/KEYSETTING.sh
+
+  displayName: 'Create Az KV File'
+
+- task: AzureCLI@2
+  inputs:
+    azureSubscription: 'Pay-As-You-Go(d955c0ba-13dc-44cf-a29a-8fed74cbb22d)'
+    scriptType: 'bash'
+    scriptLocation: 'scriptPath'
+    scriptPath: '$(Pipeline.Workspace)/KEYSETTING.sh'
+
+- task: Bash@3
+  displayName: 'Remove Generated Files (if exist)'
+  inputs:
+    targetType: 'inline'
+    script: |
+      set +x
+      rm -f ./*.txt || true
+      rm -f KEYSETTING.sh || true
+    workingDirectory: '$(Pipeline.Workspace)'
+  condition: always()
